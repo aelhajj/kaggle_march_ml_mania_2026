@@ -1,0 +1,22 @@
+[project]
+name = "march-ml-mania-2026"
+version = "0.1.0"
+description = "NCAA March Madness 2026 prediction pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "catppuccin[matplotlib]",
+    "scikit-learn",
+    "xgboost",
+    "lightgbm",
+    "tabicl",
+    "joblib",
+    "jupyterlab",
+    "ipykernel",
+]
+
+[tool.uv]
+environments = ["platform_machine == 'aarch64' and sys_platform == 'linux'"]
