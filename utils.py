@@ -482,6 +482,128 @@ def leave_one_season_out_cv(
 
 # ── Submission generation ─────────────────────────────────────
 
+def _dicts_to_lookup_dfs(
+    elo_prev: dict,
+    elo_curr: dict,
+    seed_map: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Convert lookup dicts to DataFrames for fast vectorized joins.
+
+    elo_prev keys are (end_season, team_id); we store as PredSeason = end_season + 1
+    so we can join directly on the season being predicted.
+    elo_curr keys are (season, team_id); joined directly.
+    seed_map keys are (season, team_id); joined directly.
+    """
+    elo_prev_df = pd.DataFrame(
+        [{"Season": s + 1, "TeamID": tid, "EloPrev": elo}
+         for (s, tid), elo in elo_prev.items()]
+    )
+    elo_curr_df = pd.DataFrame(
+        [{"Season": s, "TeamID": tid, "EloCurr": elo}
+         for (s, tid), elo in elo_curr.items()]
+    )
+    seed_df = pd.DataFrame(
+        [{"Season": s, "TeamID": tid, "Seed": seed}
+         for (s, tid), seed in seed_map.items()]
+    )
+    return elo_prev_df, elo_curr_df, seed_df
+
+
+def _join_team_features(
+    base: pd.DataFrame,
+    team_col: str,
+    suffix: str,
+    elo_prev_df: pd.DataFrame,
+    elo_curr_df: pd.DataFrame,
+    seed_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    massey_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """
+    Join all per-team features onto `base` for a given team column.
+    Resulting columns are suffixed (e.g. 'EloPrev_T1', 'WinPct_T1').
+    """
+    df = base.copy()
+
+    df = df.merge(
+        elo_prev_df.rename(columns={"TeamID": team_col, "EloPrev": f"EloPrev_{suffix}"}),
+        on=["Season", team_col], how="left",
+    )
+    df = df.merge(
+        elo_curr_df.rename(columns={"TeamID": team_col, "EloCurr": f"EloCurr_{suffix}"}),
+        on=["Season", team_col], how="left",
+    )
+    df = df.merge(
+        seed_df.rename(columns={"TeamID": team_col, "Seed": f"Seed_{suffix}"}),
+        on=["Season", team_col], how="left",
+    )
+
+    stat_cols = ["Season", "TeamID"] + _STAT_DIFF_COLS
+    df = df.merge(
+        stats_df[stat_cols].rename(
+            columns={"TeamID": team_col, **{c: f"{c}_{suffix}" for c in _STAT_DIFF_COLS}}
+        ),
+        on=["Season", team_col], how="left",
+    )
+
+    if massey_df is not None:
+        df = df.merge(
+            massey_df.rename(
+                columns={"TeamID": team_col,
+                         "MasseyMean": f"MasseyMean_{suffix}",
+                         "MasseyMedian": f"MasseyMedian_{suffix}"}
+            ),
+            on=["Season", team_col], how="left",
+        )
+    else:
+        df[f"MasseyMean_{suffix}"] = np.nan
+        df[f"MasseyMedian_{suffix}"] = np.nan
+
+    return df
+
+
+def build_features_vectorized(
+    sample_sub: pd.DataFrame,
+    elo_prev: dict,
+    elo_curr: dict,
+    seed_map: dict,
+    stats_df: pd.DataFrame,
+    massey_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """
+    Build the full feature matrix for a submission file vectorized via joins.
+    Returns a DataFrame with the same row order as sample_sub, feature columns only.
+    """
+    ids = sample_sub["ID"].str.split("_", expand=True)
+    ids.columns = ["Season", "T1", "T2"]
+    ids = ids.astype(int)
+
+    elo_prev_df, elo_curr_df, seed_df = _dicts_to_lookup_dfs(elo_prev, elo_curr, seed_map)
+
+    df = ids.copy()
+    df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df)
+    df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df)
+
+    out = pd.DataFrame(index=df.index)
+    out["EloPrevDiff"] = df["EloPrev_T1"].fillna(1500) - df["EloPrev_T2"].fillna(1500)
+    out["EloCurrDiff"] = df["EloCurr_T1"].fillna(1500) - df["EloCurr_T2"].fillna(1500)
+    out["SeedT1"] = df["Seed_T1"]
+    out["SeedT2"] = df["Seed_T2"]
+    out["SeedDiff"] = df["Seed_T2"] - df["Seed_T1"]
+
+    for col in _STAT_DIFF_COLS:
+        if col == "AvgTO":
+            out[f"{col}Diff"] = df[f"{col}_T2"] - df[f"{col}_T1"]
+        else:
+            out[f"{col}Diff"] = df[f"{col}_T1"] - df[f"{col}_T2"]
+
+    out["MasseyMeanDiff"] = df["MasseyMean_T2"] - df["MasseyMean_T1"]
+    out["MasseyMedianDiff"] = df["MasseyMedian_T2"] - df["MasseyMedian_T1"]
+
+    return out
+
+
 def generate_submission(
     sample_sub: pd.DataFrame,
     models: dict[str, object],
@@ -492,37 +614,27 @@ def generate_submission(
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
     feature_cols: list[str],
-    impute_cols: dict[str, float] | None = None,
+    impute_medians: dict[str, float] | None = None,
     clip_range: tuple[float, float] = (0.01, 0.99),
 ) -> pd.DataFrame:
     """
-    Generate submission by ensembling multiple models.
+    Generate submission by ensembling multiple models (vectorized).
 
-    Vectorizes feature construction then calls predict_proba per model.
-    impute_cols: {col: median_value} for models that need imputation.
+    impute_medians: {col: value} applied before models that need imputation
+    (i.e. AdaBoost, TabICL). XGBoost/LightGBM receive NaN as-is.
     """
-    ids = sample_sub["ID"].str.split("_", expand=True)
-    ids.columns = ["Season", "T1", "T2"]
-    ids = ids.astype(int)
-
-    records = []
-    for _, row in ids.iterrows():
-        feats = build_matchup_features(
-            row["T1"], row["T2"], row["Season"],
-            elo_prev, elo_curr, seed_map, stats_df, massey_df,
-        )
-        records.append(feats)
-
-    X_sub = pd.DataFrame(records)[feature_cols]
+    print("Building features...")
+    X_sub = build_features_vectorized(sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df)
+    X_sub = X_sub[feature_cols]
+    print(f"  Feature matrix: {X_sub.shape}")
 
     preds = np.zeros(len(X_sub))
     for name, model in models.items():
         w = weights[name]
-        X_input = X_sub.copy()
-        if impute_cols is not None:
-            X_input = X_input.fillna(impute_cols)
+        X_input = X_sub.fillna(impute_medians) if impute_medians else X_sub
         proba = model.predict_proba(X_input.values)[:, 1]
         preds += w * proba
+        print(f"  {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
 
     preds = np.clip(preds, *clip_range)
 
