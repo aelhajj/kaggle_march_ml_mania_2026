@@ -566,8 +566,8 @@ def leave_one_season_out_cv(
             fit_kwargs["sample_weight"] = sample_weight[train_mask]
 
         model = model_factory()
-        model.fit(X_train.values, y_train.values, **fit_kwargs)
-        proba = model.predict_proba(X_test.values)[:, 1]
+        model.fit(X_train, y_train.values, **fit_kwargs)
+        proba = model.predict_proba(X_test)[:, 1]
         results[season] = brier_score(y_test.values, proba)
         oof[test_mask] = proba
         del model, X_train, X_test
