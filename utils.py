@@ -135,6 +135,9 @@ _CSV_MAP = {
     "m_seeds":          "MNCAATourneySeeds.csv",
     "w_seeds":          "WNCAATourneySeeds.csv",
     "m_massey":         "MMasseyOrdinals.csv",
+    "m_conferences":    "MTeamConferences.csv",
+    "w_conferences":    "WTeamConferences.csv",
+    "m_coaches":        "MTeamCoaches.csv",
     "sample_sub":       "SampleSubmissionStage1.csv",
     "sample_sub2":      "SampleSubmissionStage2.csv",
 }
@@ -176,12 +179,14 @@ def compute_elo(
     hca: float = 100.0,
     revert_pct: float = 0.25,
     include_tourney: bool = True,
+    mov: bool = False,
 ) -> dict[tuple[int, int], float]:
     """
     Compute end-of-period Elo for every (Season, TeamID).
 
     If include_tourney=True:  uses regular + tournament games → end-of-season Elo.
     If include_tourney=False: uses regular season only → pre-tournament Elo.
+    If mov=True: scale K by margin of victory (FiveThirtyEight-style).
 
     Between seasons, each team's Elo regresses toward `init` by `revert_pct`.
     """
@@ -211,8 +216,16 @@ def compute_elo(
         w_adj = w_elo + (hca if w_loc == "H" else (-hca if w_loc == "A" else 0))
 
         exp_w = 1.0 / (1.0 + 10 ** ((l_elo - w_adj) / 400.0))
-        elo[w_id] = w_elo + k * (1.0 - exp_w)
-        elo[l_id] = l_elo + k * (0.0 - (1.0 - exp_w))
+
+        if mov and "WScore" in row.index:
+            margin = row["WScore"] - row["LScore"]
+            elo_diff = w_adj - l_elo
+            mov_mult = np.log(abs(margin) + 1) * (2.2 / ((elo_diff * 0.001) + 2.2))
+        else:
+            mov_mult = 1.0
+
+        elo[w_id] = w_elo + k * mov_mult * (1.0 - exp_w)
+        elo[l_id] = l_elo + k * mov_mult * (0.0 - (1.0 - exp_w))
 
     if prev_season is not None:
         for tid, r in elo.items():
@@ -227,6 +240,7 @@ def compute_elo_trajectory_stats(
     init: float = 1500.0,
     hca: float = 100.0,
     revert_pct: float = 0.25,
+    mov: bool = False,
 ) -> dict[tuple[int, int], dict]:
     """
     Compute within-season Elo trajectory stats per (Season, TeamID).
@@ -234,6 +248,7 @@ def compute_elo_trajectory_stats(
     Returns {(season, team_id): {"EloTrend": float, "EloStd": float}}.
     EloTrend = slope of Elo over the regular season (positive = team improving).
     EloStd   = std dev of within-season Elo (lower = more consistent team).
+    If mov=True: scale K by margin of victory (FiveThirtyEight-style).
     """
     from scipy.stats import linregress as _lr
 
@@ -256,8 +271,15 @@ def compute_elo_trajectory_stats(
         w_adj = w_elo + (hca if w_loc == "H" else (-hca if w_loc == "A" else 0))
         exp_w = 1.0 / (1.0 + 10 ** ((l_elo - w_adj) / 400.0))
 
-        elo[w_id] = w_elo + k * (1.0 - exp_w)
-        elo[l_id] = l_elo + k * (0.0 - (1.0 - exp_w))
+        if mov and "WScore" in row.index:
+            margin = row["WScore"] - row["LScore"]
+            elo_diff = w_adj - l_elo
+            mov_mult = np.log(abs(margin) + 1) * (2.2 / ((elo_diff * 0.001) + 2.2))
+        else:
+            mov_mult = 1.0
+
+        elo[w_id] = w_elo + k * mov_mult * (1.0 - exp_w)
+        elo[l_id] = l_elo + k * mov_mult * (0.0 - (1.0 - exp_w))
 
         for tid, r in [(w_id, elo[w_id]), (l_id, elo[l_id])]:
             key = (season, tid)
@@ -280,11 +302,16 @@ def compute_elo_trajectory_stats(
 
 def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute per-team-per-season aggregated statistics from detailed results.
+    Compute per-team-per-season possession-based statistics from detailed results.
 
-    Views each game from both the winner's and loser's perspective,
-    then groups by (Season, TeamID) to get averages.
+    Uses the Kenpom possession formula: Poss = FGA - OR + TO + 0.475 * FTA.
+    Returns efficiency (per 100 possessions) and rate stats instead of raw averages.
     """
+    cols = ["Season", "TeamID", "Score", "OppScore", "Win",
+            "FGM", "FGA", "FGM3", "FGA3", "FTM", "FTA",
+            "OR", "DR", "Ast", "TO",
+            "OppFGA", "OppOR", "OppDR", "OppTO", "OppFTA"]
+
     # Winner perspective
     w = detail_df.assign(
         TeamID=detail_df["WTeamID"],
@@ -296,13 +323,10 @@ def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
         FTM=detail_df["WFTM"], FTA=detail_df["WFTA"],
         OR=detail_df["WOR"], DR=detail_df["WDR"],
         Ast=detail_df["WAst"], TO=detail_df["WTO"],
-        Stl=detail_df["WStl"], Blk=detail_df["WBlk"],
-        OppFGM=detail_df["LFGM"], OppFGA=detail_df["LFGA"],
-        OppFGM3=detail_df["LFGM3"], OppFGA3=detail_df["LFGA3"],
-    )[["Season", "TeamID", "Score", "OppScore", "Win",
-       "FGM", "FGA", "FGM3", "FGA3", "FTM", "FTA",
-       "OR", "DR", "Ast", "TO", "Stl", "Blk",
-       "OppFGM", "OppFGA", "OppFGM3", "OppFGA3"]]
+        OppFGA=detail_df["LFGA"],
+        OppOR=detail_df["LOR"], OppDR=detail_df["LDR"],
+        OppTO=detail_df["LTO"], OppFTA=detail_df["LFTA"],
+    )[cols]
 
     # Loser perspective
     l = detail_df.assign(
@@ -315,42 +339,47 @@ def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
         FTM=detail_df["LFTM"], FTA=detail_df["LFTA"],
         OR=detail_df["LOR"], DR=detail_df["LDR"],
         Ast=detail_df["LAst"], TO=detail_df["LTO"],
-        Stl=detail_df["LStl"], Blk=detail_df["LBlk"],
-        OppFGM=detail_df["WFGM"], OppFGA=detail_df["WFGA"],
-        OppFGM3=detail_df["WFGM3"], OppFGA3=detail_df["WFGA3"],
-    )[w.columns]
+        OppFGA=detail_df["WFGA"],
+        OppOR=detail_df["WOR"], OppDR=detail_df["WDR"],
+        OppTO=detail_df["WTO"], OppFTA=detail_df["WFTA"],
+    )[cols]
 
     games = pd.concat([w, l], ignore_index=True)
     grouped = games.groupby(["Season", "TeamID"])
 
     stats = grouped.agg(
         GamesPlayed=("Win", "count"),
-        Wins=("Win", "sum"),
-        AvgScore=("Score", "mean"),
-        AvgOppScore=("OppScore", "mean"),
+        TotalPts=("Score", "sum"),
+        TotalOppPts=("OppScore", "sum"),
         FGM=("FGM", "sum"), FGA=("FGA", "sum"),
         FGM3=("FGM3", "sum"), FGA3=("FGA3", "sum"),
-        FTM=("FTM", "sum"), FTA=("FTA", "sum"),
-        AvgOR=("OR", "mean"), AvgDR=("DR", "mean"),
-        AvgAst=("Ast", "mean"), AvgTO=("TO", "mean"),
-        AvgStl=("Stl", "mean"), AvgBlk=("Blk", "mean"),
-        OppFGM=("OppFGM", "sum"), OppFGA=("OppFGA", "sum"),
-        OppFGM3=("OppFGM3", "sum"), OppFGA3=("OppFGA3", "sum"),
+        FTA=("FTA", "sum"),
+        OR=("OR", "sum"), DR=("DR", "sum"),
+        Ast=("Ast", "sum"), TO=("TO", "sum"),
+        OppFGA=("OppFGA", "sum"),
+        OppOR=("OppOR", "sum"), OppDR=("OppDR", "sum"),
+        OppTO=("OppTO", "sum"), OppFTA=("OppFTA", "sum"),
     ).reset_index()
 
-    stats["WinPct"] = stats["Wins"] / stats["GamesPlayed"]
-    stats["AvgScoreMargin"] = stats["AvgScore"] - stats["AvgOppScore"]
-    stats["FGPct"] = stats["FGM"] / stats["FGA"]
-    stats["FG3Pct"] = stats["FGM3"] / stats["FGA3"].replace(0, np.nan)
-    stats["FTPct"] = stats["FTM"] / stats["FTA"].replace(0, np.nan)
-    stats["OppFGPct"] = stats["OppFGM"] / stats["OppFGA"]
-    stats["OppFG3Pct"] = stats["OppFGM3"] / stats["OppFGA3"].replace(0, np.nan)
+    # Possession estimation (Kenpom formula)
+    stats["Poss"] = stats["FGA"] - stats["OR"] + stats["TO"] + 0.475 * stats["FTA"]
+    stats["OppPoss"] = stats["OppFGA"] - stats["OppOR"] + stats["OppTO"] + 0.475 * stats["OppFTA"]
 
-    keep = ["Season", "TeamID", "GamesPlayed", "Wins", "WinPct",
-            "AvgScore", "AvgOppScore", "AvgScoreMargin",
-            "FGPct", "FG3Pct", "FTPct",
-            "AvgOR", "AvgDR", "AvgAst", "AvgTO", "AvgStl", "AvgBlk",
-            "OppFGPct", "OppFG3Pct"]
+    # Efficiency metrics (per 100 possessions)
+    stats["OffEff"] = (stats["TotalPts"] / stats["Poss"].replace(0, np.nan)) * 100
+    stats["DefEff"] = (stats["TotalOppPts"] / stats["OppPoss"].replace(0, np.nan)) * 100
+    stats["Tempo"] = stats["Poss"] / stats["GamesPlayed"]
+
+    # Rate stats (possession/attempt-normalized)
+    stats["ORPct"] = stats["OR"] / (stats["OR"] + stats["OppDR"]).replace(0, np.nan)
+    stats["TOPct"] = stats["TO"] / stats["Poss"].replace(0, np.nan)
+    stats["FTRate"] = stats["FTA"] / stats["FGA"].replace(0, np.nan)
+    stats["AstRate"] = stats["Ast"] / stats["FGM"].replace(0, np.nan)
+    stats["ThreePtRate"] = stats["FGA3"] / stats["FGA"].replace(0, np.nan)
+
+    keep = ["Season", "TeamID",
+            "OffEff", "DefEff", "Tempo",
+            "ORPct", "TOPct", "FTRate", "AstRate", "ThreePtRate"]
     return stats[keep]
 
 
@@ -370,17 +399,149 @@ def compute_massey_features(
     late = massey_df[massey_df["RankingDayNum"] >= day_threshold]
     agg = late.groupby(["Season", "TeamID"])["OrdinalRank"].agg(
         MasseyMean="mean",
-        MasseyMedian="median",
     ).reset_index()
     return agg
+
+
+# ── Strength of schedule ─────────────────────────────────────
+
+def compute_sos(
+    m_regular: pd.DataFrame,
+    w_regular: pd.DataFrame,
+    elo_curr: dict[tuple[int, int], float],
+) -> dict[tuple[int, int], float]:
+    """
+    Strength of schedule: mean Elo of all regular-season opponents.
+
+    Available for both men's and women's teams. Uses current-season Elo
+    so SOS reflects the quality of opponents this year.
+    """
+    sos = {}
+    for df in [m_regular, w_regular]:
+        for season in df["Season"].unique():
+            sdf = df[df["Season"] == season]
+            # Build opponent list per team
+            opp_elos: dict[int, list[float]] = {}
+            for _, row in sdf.iterrows():
+                w_id, l_id = row["WTeamID"], row["LTeamID"]
+                w_opp_elo = elo_curr.get((season, l_id), 1500.0)
+                l_opp_elo = elo_curr.get((season, w_id), 1500.0)
+                opp_elos.setdefault(w_id, []).append(w_opp_elo)
+                opp_elos.setdefault(l_id, []).append(l_opp_elo)
+            for tid, elos in opp_elos.items():
+                sos[(season, tid)] = float(np.mean(elos))
+    return sos
+
+
+# ── Momentum (last-N games) ─────────────────────────────────
+
+def compute_momentum(
+    m_regular: pd.DataFrame,
+    w_regular: pd.DataFrame,
+    last_n: int = 10,
+) -> dict[tuple[int, int], float]:
+    """
+    Late-season momentum: win rate over the last N regular-season games.
+
+    Captures whether a team is hot or cold going into the tournament.
+    """
+    momentum = {}
+    for df in [m_regular, w_regular]:
+        games = df.sort_values(["Season", "DayNum"])
+        for season in games["Season"].unique():
+            sdf = games[games["Season"] == season]
+            # Build game results per team
+            team_results: dict[int, list[int]] = {}
+            for _, row in sdf.iterrows():
+                w_id, l_id = row["WTeamID"], row["LTeamID"]
+                team_results.setdefault(w_id, []).append(1)
+                team_results.setdefault(l_id, []).append(0)
+            for tid, results in team_results.items():
+                last = results[-last_n:]
+                momentum[(season, tid)] = float(np.mean(last))
+    return momentum
+
+
+# ── Conference strength ──────────────────────────────────────
+
+def compute_conference_strength(
+    m_conf: pd.DataFrame,
+    w_conf: pd.DataFrame,
+    elo_curr: dict[tuple[int, int], float],
+) -> dict[tuple[int, int], float]:
+    """
+    Conference strength: mean Elo of all teams in a team's conference.
+
+    Available for both men's and women's teams, filling the gap where
+    women lack Massey ordinals.
+    """
+    conf_strength = {}
+    for conf_df in [m_conf, w_conf]:
+        for season in conf_df["Season"].unique():
+            sdf = conf_df[conf_df["Season"] == season]
+            # Compute mean Elo per conference
+            conf_elo: dict[str, list[float]] = {}
+            for _, row in sdf.iterrows():
+                tid = row["TeamID"]
+                abbrev = row["ConfAbbrev"]
+                elo = elo_curr.get((season, tid), 1500.0)
+                conf_elo.setdefault(abbrev, []).append(elo)
+            conf_means = {abbrev: float(np.mean(elos)) for abbrev, elos in conf_elo.items()}
+            # Assign conference mean to each team
+            for _, row in sdf.iterrows():
+                conf_strength[(season, row["TeamID"])] = conf_means[row["ConfAbbrev"]]
+    return conf_strength
+
+
+# ── Coach tournament experience (men only) ───────────────────
+
+def compute_coach_experience(
+    coaches_df: pd.DataFrame,
+    m_tourney: pd.DataFrame,
+) -> dict[tuple[int, int], int]:
+    """
+    Cumulative NCAA tournament appearances for each team's head coach.
+
+    Men's only — uses MTeamCoaches.csv. Counts how many times the coach
+    has taken a team to the tournament in prior seasons (avoids leakage).
+    """
+    # Find which teams made the tournament each season
+    tourney_teams = set()
+    for _, row in m_tourney.iterrows():
+        tourney_teams.add((row["Season"], row["WTeamID"]))
+        tourney_teams.add((row["Season"], row["LTeamID"]))
+
+    # For each coach, count cumulative tournament appearances (prior seasons only)
+    # coaches_df has: Season, TeamID, FirstDayNum, LastDayNum, CoachName
+    # A coach active at DayNum >= 132 (tournament time) is the tournament coach
+    tourney_coaches = coaches_df[coaches_df["LastDayNum"] >= 132].copy()
+
+    coach_cum_exp: dict[str, int] = {}
+    coach_exp = {}
+
+    for season in sorted(tourney_coaches["Season"].unique()):
+        sdf = tourney_coaches[tourney_coaches["Season"] == season]
+        for _, row in sdf.iterrows():
+            coach = row["CoachName"]
+            tid = row["TeamID"]
+            # Record current cumulative experience (from prior seasons)
+            coach_exp[(season, tid)] = coach_cum_exp.get(coach, 0)
+
+        # After recording, update cumulative counts for this season
+        for _, row in sdf.iterrows():
+            coach = row["CoachName"]
+            tid = row["TeamID"]
+            if (season, tid) in tourney_teams:
+                coach_cum_exp[coach] = coach_cum_exp.get(coach, 0) + 1
+
+    return coach_exp
 
 
 # ── Matchup features ─────────────────────────────────────────
 
 _STAT_DIFF_COLS = [
-    "WinPct", "AvgScoreMargin", "FGPct", "FG3Pct", "FTPct",
-    "AvgOR", "AvgDR", "AvgAst", "AvgTO", "AvgStl", "AvgBlk",
-    "OppFGPct", "OppFG3Pct",
+    "OffEff", "DefEff", "Tempo",
+    "ORPct", "TOPct", "FTRate", "AstRate", "ThreePtRate",
 ]
 
 
@@ -397,13 +558,13 @@ def _get_team_stats(team_id: int, season: int, stats_df: pd.DataFrame) -> dict:
 def _get_massey(team_id: int, season: int, massey_df: pd.DataFrame | None) -> dict:
     """Lookup Massey features for a team."""
     if massey_df is None:
-        return {"MasseyMean": np.nan, "MasseyMedian": np.nan}
+        return {"MasseyMean": np.nan}
     mask = (massey_df["Season"] == season) & (massey_df["TeamID"] == team_id)
     rows = massey_df.loc[mask]
     if rows.empty:
-        return {"MasseyMean": np.nan, "MasseyMedian": np.nan}
+        return {"MasseyMean": np.nan}
     row = rows.iloc[0]
-    return {"MasseyMean": row["MasseyMean"], "MasseyMedian": row["MasseyMedian"]}
+    return {"MasseyMean": row["MasseyMean"]}
 
 
 def build_matchup_features(
@@ -412,6 +573,10 @@ def build_matchup_features(
     seed_map: dict, stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
     elo_stats: dict | None = None,
+    sos: dict | None = None,
+    momentum: dict | None = None,
+    conf_strength: dict | None = None,
+    coach_exp: dict | None = None,
 ) -> dict:
     """
     Build feature dict for a Team1-vs-Team2 matchup.
@@ -429,7 +594,7 @@ def build_matchup_features(
 
     feats = {
         "EloPrevDiff": e1_prev - e2_prev,
-        "EloCurrDiff": e1_curr - e2_curr,
+        "EloMOVDiff": e1_curr - e2_curr,
         "SeedT1": s1,
         "SeedT2": s2,
     }
@@ -440,22 +605,44 @@ def build_matchup_features(
     else:
         feats["SeedDiff"] = np.nan
 
-    # Season stats diffs
+    # Season stats diffs (possession-based metrics)
     st1 = _get_team_stats(t1, season, stats_df)
     st2 = _get_team_stats(t2, season, stats_df)
     for col in _STAT_DIFF_COLS:
-        if col == "AvgTO":
+        if col == "TOPct":
             feats[f"{col}Diff"] = st2[col] - st1[col]  # fewer TOs is better
+        elif col == "DefEff":
+            feats[f"{col}Diff"] = st2[col] - st1[col]  # lower DefEff is better
         else:
             feats[f"{col}Diff"] = st1[col] - st2[col]
 
-    # Massey diffs
+    # Massey diff (men only, NaN for women)
     m1 = _get_massey(t1, season, massey_df)
     m2 = _get_massey(t2, season, massey_df)
     feats["MasseyMeanDiff"] = m2["MasseyMean"] - m1["MasseyMean"]  # lower rank is better
-    feats["MasseyMedianDiff"] = m2["MasseyMedian"] - m1["MasseyMedian"]
 
-    # Elo trajectory stats (optional)
+    # Strength of schedule
+    if sos is not None:
+        feats["SOSDiff"] = sos.get((season, t1), 1500.0) - sos.get((season, t2), 1500.0)
+
+    # Momentum (last-10 game win rate)
+    if momentum is not None:
+        feats["MomentumDiff"] = momentum.get((season, t1), 0.5) - momentum.get((season, t2), 0.5)
+
+    # Conference strength
+    if conf_strength is not None:
+        feats["ConfStrengthDiff"] = conf_strength.get((season, t1), 1500.0) - conf_strength.get((season, t2), 1500.0)
+
+    # Coach tournament experience (men only)
+    if coach_exp is not None:
+        c1 = coach_exp.get((season, t1))
+        c2 = coach_exp.get((season, t2))
+        if c1 is not None and c2 is not None:
+            feats["CoachExpDiff"] = c1 - c2
+        else:
+            feats["CoachExpDiff"] = np.nan
+
+    # Elo trajectory stats
     if elo_stats is not None:
         _nan = {"EloTrend": np.nan, "EloStd": np.nan}
         e1s = elo_stats.get((season, t1), _nan)
@@ -478,6 +665,10 @@ def build_training_data(
     massey_df: pd.DataFrame | None,
     min_season: int = 2003,
     elo_stats: dict | None = None,
+    sos: dict | None = None,
+    momentum: dict | None = None,
+    conf_strength: dict | None = None,
+    coach_exp: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
     Build (X, y, seasons) from historical tournament results.
@@ -502,6 +693,8 @@ def build_training_data(
                 t1, t2, season,
                 elo_prev, elo_curr, seed_map, stats_df, massey_df,
                 elo_stats=elo_stats,
+                sos=sos, momentum=momentum,
+                conf_strength=conf_strength, coach_exp=coach_exp,
             )
             records.append(feats)
             labels.append(1 if w_id == t1 else 0)
@@ -613,6 +806,13 @@ def _dicts_to_lookup_dfs(
     return elo_prev_df, elo_curr_df, seed_df
 
 
+def _dict_to_df(d: dict, value_col: str) -> pd.DataFrame:
+    """Convert {(Season, TeamID): value} dict to a DataFrame."""
+    return pd.DataFrame(
+        [{"Season": s, "TeamID": tid, value_col: v} for (s, tid), v in d.items()]
+    )
+
+
 def _join_team_features(
     base: pd.DataFrame,
     team_col: str,
@@ -623,10 +823,14 @@ def _join_team_features(
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
     elo_stats_df: pd.DataFrame | None = None,
+    sos_df: pd.DataFrame | None = None,
+    momentum_df: pd.DataFrame | None = None,
+    conf_df: pd.DataFrame | None = None,
+    coach_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Join all per-team features onto `base` for a given team column.
-    Resulting columns are suffixed (e.g. 'EloPrev_T1', 'WinPct_T1').
+    Resulting columns are suffixed (e.g. 'EloPrev_T1', 'OffEff_T1').
     """
     df = base.copy()
 
@@ -654,28 +858,43 @@ def _join_team_features(
     if massey_df is not None:
         df = df.merge(
             massey_df.rename(
-                columns={"TeamID": team_col,
-                         "MasseyMean": f"MasseyMean_{suffix}",
-                         "MasseyMedian": f"MasseyMedian_{suffix}"}
+                columns={"TeamID": team_col, "MasseyMean": f"MasseyMean_{suffix}"}
             ),
             on=["Season", team_col], how="left",
         )
     else:
         df[f"MasseyMean_{suffix}"] = np.nan
-        df[f"MasseyMedian_{suffix}"] = np.nan
 
-    if elo_stats_df is not None:
-        df = df.merge(
-            elo_stats_df.rename(
-                columns={"TeamID": team_col,
-                         "EloTrend": f"EloTrend_{suffix}",
-                         "EloStd": f"EloStd_{suffix}"}
-            ),
-            on=["Season", team_col], how="left",
-        )
-    else:
-        df[f"EloTrend_{suffix}"] = np.nan
-        df[f"EloStd_{suffix}"] = np.nan
+    for extra_df, col_name in [
+        (elo_stats_df, None),  # handled specially below
+        (sos_df, "SOS"),
+        (momentum_df, "Momentum"),
+        (conf_df, "ConfStrength"),
+        (coach_df, "CoachExp"),
+    ]:
+        if col_name is None:
+            # Elo stats has two columns
+            if extra_df is not None:
+                df = df.merge(
+                    extra_df.rename(
+                        columns={"TeamID": team_col,
+                                 "EloTrend": f"EloTrend_{suffix}",
+                                 "EloStd": f"EloStd_{suffix}"}
+                    ),
+                    on=["Season", team_col], how="left",
+                )
+            else:
+                df[f"EloTrend_{suffix}"] = np.nan
+                df[f"EloStd_{suffix}"] = np.nan
+        elif extra_df is not None:
+            df = df.merge(
+                extra_df.rename(
+                    columns={"TeamID": team_col, col_name: f"{col_name}_{suffix}"}
+                ),
+                on=["Season", team_col], how="left",
+            )
+        else:
+            df[f"{col_name}_{suffix}"] = np.nan
 
     return df
 
@@ -688,6 +907,10 @@ def build_features_vectorized(
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
     elo_stats: dict | None = None,
+    sos: dict | None = None,
+    momentum: dict | None = None,
+    conf_strength: dict | None = None,
+    coach_exp: dict | None = None,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for a submission file vectorized via joins.
@@ -698,38 +921,57 @@ def build_features_vectorized(
     ids = ids.astype(int)
 
     elo_prev_df, elo_curr_df, seed_df = _dicts_to_lookup_dfs(elo_prev, elo_curr, seed_map)
-    elo_stats_df = None
-    if elo_stats is not None:
-        elo_stats_df = pd.DataFrame(
-            [{"Season": s, "TeamID": tid, "EloTrend": v["EloTrend"], "EloStd": v["EloStd"]}
-             for (s, tid), v in elo_stats.items()]
-        )
+    elo_stats_df = _dict_to_df_multi(elo_stats) if elo_stats else None
+    sos_df = _dict_to_df(sos, "SOS") if sos else None
+    momentum_df = _dict_to_df(momentum, "Momentum") if momentum else None
+    conf_df = _dict_to_df(conf_strength, "ConfStrength") if conf_strength else None
+    coach_df = _dict_to_df(coach_exp, "CoachExp") if coach_exp else None
 
     df = ids.copy()
-    df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, elo_stats_df)
-    df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, elo_stats_df)
+    join_args = dict(elo_stats_df=elo_stats_df, sos_df=sos_df, momentum_df=momentum_df,
+                     conf_df=conf_df, coach_df=coach_df)
+    df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, **join_args)
+    df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, **join_args)
 
     out = pd.DataFrame(index=df.index)
     out["EloPrevDiff"] = df["EloPrev_T1"].fillna(1500) - df["EloPrev_T2"].fillna(1500)
-    out["EloCurrDiff"] = df["EloCurr_T1"].fillna(1500) - df["EloCurr_T2"].fillna(1500)
+    out["EloMOVDiff"] = df["EloCurr_T1"].fillna(1500) - df["EloCurr_T2"].fillna(1500)
     out["SeedT1"] = df["Seed_T1"]
     out["SeedT2"] = df["Seed_T2"]
     out["SeedDiff"] = df["Seed_T2"] - df["Seed_T1"]
 
     for col in _STAT_DIFF_COLS:
-        if col == "AvgTO":
+        if col == "TOPct":
+            out[f"{col}Diff"] = df[f"{col}_T2"] - df[f"{col}_T1"]
+        elif col == "DefEff":
             out[f"{col}Diff"] = df[f"{col}_T2"] - df[f"{col}_T1"]
         else:
             out[f"{col}Diff"] = df[f"{col}_T1"] - df[f"{col}_T2"]
 
     out["MasseyMeanDiff"] = df["MasseyMean_T2"] - df["MasseyMean_T1"]
-    out["MasseyMedianDiff"] = df["MasseyMedian_T2"] - df["MasseyMedian_T1"]
+
+    if sos is not None:
+        out["SOSDiff"] = df["SOS_T1"].fillna(1500) - df["SOS_T2"].fillna(1500)
+    if momentum is not None:
+        out["MomentumDiff"] = df["Momentum_T1"].fillna(0.5) - df["Momentum_T2"].fillna(0.5)
+    if conf_strength is not None:
+        out["ConfStrengthDiff"] = df["ConfStrength_T1"].fillna(1500) - df["ConfStrength_T2"].fillna(1500)
+    if coach_exp is not None:
+        out["CoachExpDiff"] = df["CoachExp_T1"] - df["CoachExp_T2"]
 
     if elo_stats is not None:
         out["EloTrendDiff"] = df["EloTrend_T1"] - df["EloTrend_T2"]
         out["EloStdDiff"] = df["EloStd_T1"] - df["EloStd_T2"]
 
     return out
+
+
+def _dict_to_df_multi(elo_stats: dict) -> pd.DataFrame:
+    """Convert elo_stats dict to DataFrame with EloTrend and EloStd columns."""
+    return pd.DataFrame(
+        [{"Season": s, "TeamID": tid, "EloTrend": v["EloTrend"], "EloStd": v["EloStd"]}
+         for (s, tid), v in elo_stats.items()]
+    )
 
 
 def generate_submission(
@@ -745,6 +987,10 @@ def generate_submission(
     impute_medians: dict[str, float] | None = None,
     clip_range: tuple[float, float] = (0.01, 0.99),
     elo_stats: dict | None = None,
+    sos: dict | None = None,
+    momentum: dict | None = None,
+    conf_strength: dict | None = None,
+    coach_exp: dict | None = None,
 ) -> pd.DataFrame:
     """
     Generate submission by ensembling multiple models (vectorized).
@@ -753,7 +999,11 @@ def generate_submission(
     (i.e. TabICL). XGBoost/LightGBM/CatBoost receive NaN as-is.
     """
     print("Building features...")
-    X_sub = build_features_vectorized(sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df, elo_stats=elo_stats)
+    X_sub = build_features_vectorized(
+        sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df,
+        elo_stats=elo_stats, sos=sos, momentum=momentum,
+        conf_strength=conf_strength, coach_exp=coach_exp,
+    )
     X_sub = X_sub[feature_cols]
     print(f"  Feature matrix: {X_sub.shape}")
 
