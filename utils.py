@@ -1,3 +1,4 @@
+# %% [code] {"jupyter":{"outputs_hidden":false}}
 """
 Utilities for March Machine Learning Mania 2026:
 data loading, feature engineering, model caching, evaluation, and visualization.
