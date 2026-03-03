@@ -665,7 +665,7 @@ def generate_submission(
     for name, model in models.items():
         w = weights[name]
         X_input = X_sub.fillna(impute_medians) if impute_medians else X_sub
-        proba = model.predict_proba(X_input.values)[:, 1]
+        proba = model.predict_proba(X_input)[:, 1]
         preds += w * proba
         print(f"  {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
 
