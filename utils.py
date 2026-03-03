@@ -218,6 +218,61 @@ def compute_elo(
     return season_elos
 
 
+def compute_elo_trajectory_stats(
+    regular_df: pd.DataFrame,
+    k: float = 20.0,
+    init: float = 1500.0,
+    hca: float = 100.0,
+    revert_pct: float = 0.25,
+) -> dict[tuple[int, int], dict]:
+    """
+    Compute within-season Elo trajectory stats per (Season, TeamID).
+
+    Returns {(season, team_id): {"EloTrend": float, "EloStd": float}}.
+    EloTrend = slope of Elo over the regular season (positive = team improving).
+    EloStd   = std dev of within-season Elo (lower = more consistent team).
+    """
+    from scipy.stats import linregress as _lr
+
+    games = regular_df.sort_values(["Season", "DayNum"])
+    elo: dict[int, float] = {}
+    trajectory: dict[tuple[int, int], list[float]] = {}
+    prev_season = None
+
+    for _, row in games.iterrows():
+        season = row["Season"]
+        if season != prev_season and prev_season is not None:
+            elo = {tid: (1 - revert_pct) * r + revert_pct * init for tid, r in elo.items()}
+        prev_season = season
+
+        w_id, l_id = row["WTeamID"], row["LTeamID"]
+        w_elo = elo.get(w_id, init)
+        l_elo = elo.get(l_id, init)
+
+        w_loc = row.get("WLoc", "N")
+        w_adj = w_elo + (hca if w_loc == "H" else (-hca if w_loc == "A" else 0))
+        exp_w = 1.0 / (1.0 + 10 ** ((l_elo - w_adj) / 400.0))
+
+        elo[w_id] = w_elo + k * (1.0 - exp_w)
+        elo[l_id] = l_elo + k * (0.0 - (1.0 - exp_w))
+
+        for tid, r in [(w_id, elo[w_id]), (l_id, elo[l_id])]:
+            key = (season, tid)
+            if key not in trajectory:
+                trajectory[key] = []
+            trajectory[key].append(r)
+
+    result = {}
+    for (season, tid), vals in trajectory.items():
+        if len(vals) < 3:
+            result[(season, tid)] = {"EloTrend": np.nan, "EloStd": np.nan}
+        else:
+            slope = float(_lr(range(len(vals)), vals).slope)
+            result[(season, tid)] = {"EloTrend": slope, "EloStd": float(np.std(vals))}
+
+    return result
+
+
 # ── Season statistics ─────────────────────────────────────────
 
 def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
@@ -353,6 +408,7 @@ def build_matchup_features(
     elo_prev: dict, elo_curr: dict,
     seed_map: dict, stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
+    elo_stats: dict | None = None,
 ) -> dict:
     """
     Build feature dict for a Team1-vs-Team2 matchup.
@@ -396,6 +452,14 @@ def build_matchup_features(
     feats["MasseyMeanDiff"] = m2["MasseyMean"] - m1["MasseyMean"]  # lower rank is better
     feats["MasseyMedianDiff"] = m2["MasseyMedian"] - m1["MasseyMedian"]
 
+    # Elo trajectory stats (optional)
+    if elo_stats is not None:
+        _nan = {"EloTrend": np.nan, "EloStd": np.nan}
+        e1s = elo_stats.get((season, t1), _nan)
+        e2s = elo_stats.get((season, t2), _nan)
+        feats["EloTrendDiff"] = e1s["EloTrend"] - e2s["EloTrend"]
+        feats["EloStdDiff"] = e1s["EloStd"] - e2s["EloStd"]
+
     return feats
 
 
@@ -410,6 +474,7 @@ def build_training_data(
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
     min_season: int = 2003,
+    elo_stats: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
     Build (X, y, seasons) from historical tournament results.
@@ -433,6 +498,7 @@ def build_training_data(
             feats = build_matchup_features(
                 t1, t2, season,
                 elo_prev, elo_curr, seed_map, stats_df, massey_df,
+                elo_stats=elo_stats,
             )
             records.append(feats)
             labels.append(1 if w_id == t1 else 0)
@@ -553,6 +619,7 @@ def _join_team_features(
     seed_df: pd.DataFrame,
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
+    elo_stats_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Join all per-team features onto `base` for a given team column.
@@ -594,6 +661,19 @@ def _join_team_features(
         df[f"MasseyMean_{suffix}"] = np.nan
         df[f"MasseyMedian_{suffix}"] = np.nan
 
+    if elo_stats_df is not None:
+        df = df.merge(
+            elo_stats_df.rename(
+                columns={"TeamID": team_col,
+                         "EloTrend": f"EloTrend_{suffix}",
+                         "EloStd": f"EloStd_{suffix}"}
+            ),
+            on=["Season", team_col], how="left",
+        )
+    else:
+        df[f"EloTrend_{suffix}"] = np.nan
+        df[f"EloStd_{suffix}"] = np.nan
+
     return df
 
 
@@ -604,6 +684,7 @@ def build_features_vectorized(
     seed_map: dict,
     stats_df: pd.DataFrame,
     massey_df: pd.DataFrame | None,
+    elo_stats: dict | None = None,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for a submission file vectorized via joins.
@@ -614,10 +695,16 @@ def build_features_vectorized(
     ids = ids.astype(int)
 
     elo_prev_df, elo_curr_df, seed_df = _dicts_to_lookup_dfs(elo_prev, elo_curr, seed_map)
+    elo_stats_df = None
+    if elo_stats is not None:
+        elo_stats_df = pd.DataFrame(
+            [{"Season": s, "TeamID": tid, "EloTrend": v["EloTrend"], "EloStd": v["EloStd"]}
+             for (s, tid), v in elo_stats.items()]
+        )
 
     df = ids.copy()
-    df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df)
-    df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df)
+    df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, elo_stats_df)
+    df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, elo_stats_df)
 
     out = pd.DataFrame(index=df.index)
     out["EloPrevDiff"] = df["EloPrev_T1"].fillna(1500) - df["EloPrev_T2"].fillna(1500)
@@ -635,6 +722,10 @@ def build_features_vectorized(
     out["MasseyMeanDiff"] = df["MasseyMean_T2"] - df["MasseyMean_T1"]
     out["MasseyMedianDiff"] = df["MasseyMedian_T2"] - df["MasseyMedian_T1"]
 
+    if elo_stats is not None:
+        out["EloTrendDiff"] = df["EloTrend_T1"] - df["EloTrend_T2"]
+        out["EloStdDiff"] = df["EloStd_T1"] - df["EloStd_T2"]
+
     return out
 
 
@@ -650,15 +741,16 @@ def generate_submission(
     feature_cols: list[str],
     impute_medians: dict[str, float] | None = None,
     clip_range: tuple[float, float] = (0.01, 0.99),
+    elo_stats: dict | None = None,
 ) -> pd.DataFrame:
     """
     Generate submission by ensembling multiple models (vectorized).
 
     impute_medians: {col: value} applied before models that need imputation
-    (i.e. AdaBoost, TabICL). XGBoost/LightGBM receive NaN as-is.
+    (i.e. TabICL). XGBoost/LightGBM/CatBoost receive NaN as-is.
     """
     print("Building features...")
-    X_sub = build_features_vectorized(sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df)
+    X_sub = build_features_vectorized(sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df, elo_stats=elo_stats)
     X_sub = X_sub[feature_cols]
     print(f"  Feature matrix: {X_sub.shape}")
 

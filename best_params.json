@@ -19,5 +19,14 @@
     "max_depth": 3,
     "learning_rate": 0.01,
     "colsample_bytree": 0.8
+  },
+  "catboost": {
+    "subsample": 0.8,
+    "min_data_in_leaf": 10,
+    "learning_rate": 0.01,
+    "l2_leaf_reg": 3,
+    "iterations": 500,
+    "depth": 4,
+    "colsample_bylevel": 0.8
   }
 }
