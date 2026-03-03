@@ -66,6 +66,7 @@ def _instantiate(model_factory, params: dict, random_state: int, model_kwargs: d
 def train_or_load(name: str, model_factory, X_train, y_train,
                   param_dist: dict | None = None, random_state: int = 42,
                   model_kwargs: dict | None = None,
+                  sample_weight: np.ndarray | None = None,
                   **search_kwargs):
     """
     Load a fitted model from disk if available, otherwise train one.
@@ -76,7 +77,10 @@ def train_or_load(name: str, model_factory, X_train, y_train,
       3. RandomizedSearchCV                    → full search, then save params + model
 
     If param_dist is None, no search is performed.
+    sample_weight is passed to fit() when provided (XGBoost/LightGBM support it).
     """
+    fit_kwargs = {"sample_weight": sample_weight} if sample_weight is not None else {}
+
     model = load_model(name)
     if model is not None:
         print(f"[cache] Loaded {name} from disk.")
@@ -87,7 +91,7 @@ def train_or_load(name: str, model_factory, X_train, y_train,
         if cached:
             print(f"[cache] Loaded {name} params: {cached}")
             model = _instantiate(model_factory, cached, random_state, model_kwargs)
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, **fit_kwargs)
         else:
             search = RandomizedSearchCV(
                 _instantiate(model_factory, {}, random_state, model_kwargs),
@@ -95,13 +99,13 @@ def train_or_load(name: str, model_factory, X_train, y_train,
                 random_state=random_state,
                 **search_kwargs,
             )
-            search.fit(X_train, y_train)
+            search.fit(X_train, y_train, **fit_kwargs)
             model = search.best_estimator_
             save_params(name, search.best_params_)
             print(f"Best params: {search.best_params_}")
     else:
         model = _instantiate(model_factory, {}, random_state, model_kwargs)
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, **fit_kwargs)
 
     save_model(name, model)
     return model
@@ -439,6 +443,17 @@ def build_training_data(
 
 # ── Evaluation ────────────────────────────────────────────────
 
+def compute_sample_weights(seasons: pd.Series, decay: float = 0.60) -> np.ndarray:
+    """
+    Exponential recency weights: weight = decay^(max_season - season).
+
+    decay=0.60 means 2025→1.0, 2024→0.6, 2023→0.36, 2021→0.13 (COVID bubble).
+    Older seasons contribute very little; recent seasons drive the fit.
+    """
+    max_season = seasons.max()
+    return np.array([decay ** (max_season - s) for s in seasons])
+
+
 def brier_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Brier score = mean((y_true - y_pred)^2). Lower is better."""
     return float(np.mean((np.asarray(y_true) - np.asarray(y_pred)) ** 2))
@@ -450,18 +465,20 @@ def leave_one_season_out_cv(
     y: pd.Series,
     seasons: pd.Series,
     impute: bool = False,
+    sample_weight: np.ndarray | None = None,
 ) -> dict[int, float]:
     """
     Leave-one-season-out CV returning {season: brier_score}.
 
     model_factory: callable returning an unfitted sklearn-compatible model.
-    impute: if True, fill NaN with training-set column medians (for models
-            that don't handle NaN natively like AdaBoost/TabICL).
+    impute: if True, fill NaN with training-set column medians.
+    sample_weight: per-sample weights (e.g. from compute_sample_weights).
+                   Only the training-fold slice is passed to fit().
     """
     results = {}
     for season in sorted(seasons.unique()):
-        train_mask = seasons != season
-        test_mask = seasons == season
+        train_mask = (seasons != season).values
+        test_mask = (seasons == season).values
 
         X_train, X_test = X[train_mask].copy(), X[test_mask].copy()
         y_train, y_test = y[train_mask], y[test_mask]
@@ -471,8 +488,12 @@ def leave_one_season_out_cv(
             X_train = X_train.fillna(medians)
             X_test = X_test.fillna(medians)
 
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight[train_mask]
+
         model = model_factory()
-        model.fit(X_train.values, y_train.values)
+        model.fit(X_train.values, y_train.values, **fit_kwargs)
         proba = model.predict_proba(X_test.values)[:, 1]
         results[season] = brier_score(y_test.values, proba)
 

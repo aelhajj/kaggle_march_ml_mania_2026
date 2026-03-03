@@ -19,9 +19,5 @@
     "max_depth": 3,
     "learning_rate": 0.01,
     "colsample_bytree": 0.7
-  },
-  "adaboost": {
-    "n_estimators": 100,
-    "learning_rate": 0.05
   }
 }

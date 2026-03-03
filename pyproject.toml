@@ -12,6 +12,7 @@ dependencies = [
     "scikit-learn",
     "xgboost",
     "lightgbm",
+    "catboost",
     "tabicl",
     "joblib",
     "jupyterlab",
