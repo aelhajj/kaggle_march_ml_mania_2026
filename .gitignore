@@ -8,6 +8,7 @@ data/
 models/
 cache/
 catboost_info/
+examples/
 # C extensions
 *.so
 
