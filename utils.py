@@ -92,6 +92,7 @@ def train_or_load(name: str, model_factory, X_train, y_train,
             search = RandomizedSearchCV(
                 _instantiate(model_factory, {}, random_state, model_kwargs),
                 param_dist,
+                random_state=random_state,
                 **search_kwargs,
             )
             search.fit(X_train, y_train)
