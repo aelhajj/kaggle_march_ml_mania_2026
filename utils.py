@@ -757,10 +757,19 @@ def generate_submission(
     print(f"  Feature matrix: {X_sub.shape}")
 
     preds = np.zeros(len(X_sub))
+    X_imputed = X_sub.fillna(impute_medians) if impute_medians else None
     for name, model in models.items():
         w = weights[name]
-        X_input = X_sub.fillna(impute_medians) if impute_medians else X_sub
-        proba = model.predict_proba(X_input)[:, 1]
+        if w == 0:
+            print(f"  {name}: skipped (weight=0)")
+            continue
+        X_input = X_imputed if X_imputed is not None else X_sub
+        # Batch inference for heavy models (e.g. TabICL) to avoid OOM
+        batch_size = 10_000
+        proba = np.empty(len(X_input))
+        for start in range(0, len(X_input), batch_size):
+            end = min(start + batch_size, len(X_input))
+            proba[start:end] = model.predict_proba(X_input.iloc[start:end].values)[:, 1]
         preds += w * proba
         print(f"  {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
 
