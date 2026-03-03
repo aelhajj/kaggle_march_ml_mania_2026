@@ -466,6 +466,7 @@ def leave_one_season_out_cv(
     seasons: pd.Series,
     impute: bool = False,
     sample_weight: np.ndarray | None = None,
+    return_preds: bool = False,
 ) -> dict[int, float]:
     """
     Leave-one-season-out CV returning {season: brier_score}.
@@ -474,8 +475,11 @@ def leave_one_season_out_cv(
     impute: if True, fill NaN with training-set column medians.
     sample_weight: per-sample weights (e.g. from compute_sample_weights).
                    Only the training-fold slice is passed to fit().
+    return_preds: if True, also return array of OOF predictions aligned to X.
     """
+    import gc
     results = {}
+    oof = np.zeros(len(y))
     for season in sorted(seasons.unique()):
         train_mask = (seasons != season).values
         test_mask = (seasons == season).values
@@ -496,9 +500,14 @@ def leave_one_season_out_cv(
         model.fit(X_train.values, y_train.values, **fit_kwargs)
         proba = model.predict_proba(X_test.values)[:, 1]
         results[season] = brier_score(y_test.values, proba)
+        oof[test_mask] = proba
+        del model, X_train, X_test
+        gc.collect()
 
     mean_b = np.mean(list(results.values()))
     print(f"  LOSO mean Brier: {mean_b:.4f}")
+    if return_preds:
+        return results, oof
     return results
 
 

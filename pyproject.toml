@@ -17,6 +17,7 @@ dependencies = [
     "joblib",
     "jupyterlab",
     "ipykernel",
+    "pyarrow>=23.0.1",
 ]
 
 [tool.uv]
