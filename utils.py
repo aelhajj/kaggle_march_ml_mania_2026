@@ -1,26 +1,22 @@
-# %% [code]
-# %% [code]
-# %% [code]
-# %% [code]
-# %% [code]
-# %% [code]
-# %% [code] {"jupyter":{"outputs_hidden":false}}
 """
-Utilities for March Machine Learning Mania 2026:
-data loading, feature engineering, model caching, evaluation, and visualization.
+March Machine Learning Mania 2026: data loading, features, model cache, evaluation, visualization.
+
+One big util file because it's already complicated to use these in Kaggle.
 """
 
+import gc
 import json
 import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from scipy.stats import linregress
+from sklearn.calibration import calibration_curve
 from sklearn.model_selection import RandomizedSearchCV
-import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-# ── Hyperparameter cache ──────────────────────────────────────
+# ── Hyperparameter & model cache ───────────────────────────────
 
 _PARAMS_FILE = Path("best_params.json")
 
@@ -38,8 +34,6 @@ def load_params(name: str, path: Path = _PARAMS_FILE) -> dict | None:
         return None
     return json.loads(path.read_text()).get(name)
 
-
-# ── Model cache ───────────────────────────────────────────────
 
 _MODELS_DIR = Path("models")
 
@@ -118,7 +112,7 @@ def train_or_load(name: str, model_factory, X_train, y_train,
     return model
 
 
-# ── Data loading ──────────────────────────────────────────────
+# ── Data loading ───────────────────────────────────────────────
 
 DATA_DIR = Path("data")
 
@@ -154,7 +148,7 @@ def load_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     return data
 
 
-# ── Seed helpers ──────────────────────────────────────────────
+# ── Seeds ──────────────────────────────────────────────────────
 
 def parse_seed(seed_str: str) -> int:
     """Extract numeric seed from strings like 'W01', 'X16a' → 1, 16."""
@@ -170,7 +164,7 @@ def build_seed_map(m_seeds: pd.DataFrame, w_seeds: pd.DataFrame) -> dict[tuple[i
     return seed_map
 
 
-# ── Elo rating system ─────────────────────────────────────────
+# ── Elo rating ─────────────────────────────────────────────────
 
 def compute_elo(
     regular_df: pd.DataFrame,
@@ -251,8 +245,6 @@ def compute_elo_trajectory_stats(
     EloStd   = std dev of within-season Elo (lower = more consistent team).
     If mov=True: scale K by margin of victory (FiveThirtyEight-style).
     """
-    from scipy.stats import linregress as _lr
-
     games = regular_df.sort_values(["Season", "DayNum"])
     elo: dict[int, float] = {}
     trajectory: dict[tuple[int, int], list[float]] = {}
@@ -293,13 +285,13 @@ def compute_elo_trajectory_stats(
         if len(vals) < 3:
             result[(season, tid)] = {"EloTrend": np.nan, "EloStd": np.nan}
         else:
-            slope = float(_lr(range(len(vals)), vals).slope)
+            slope = float(linregress(range(len(vals)), vals).slope)
             result[(season, tid)] = {"EloTrend": slope, "EloStd": float(np.std(vals))}
 
     return result
 
 
-# ── Season statistics ─────────────────────────────────────────
+# ── Season stats (Kenpom-style) ────────────────────────────────
 
 def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -384,7 +376,7 @@ def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
     return stats[keep]
 
 
-# ── Massey ordinals ───────────────────────────────────────────
+# ── Massey ordinals (men only) ──────────────────────────────────
 
 def compute_massey_features(
     massey_df: pd.DataFrame,
@@ -404,7 +396,7 @@ def compute_massey_features(
     return agg
 
 
-# ── Strength of schedule ─────────────────────────────────────
+# ── Strength of schedule ───────────────────────────────────────
 
 def compute_sos(
     m_regular: pd.DataFrame,
@@ -434,7 +426,7 @@ def compute_sos(
     return sos
 
 
-# ── Momentum (last-N games) ─────────────────────────────────
+# ── Momentum (last-N games) ────────────────────────────────────
 
 def compute_momentum(
     m_regular: pd.DataFrame,
@@ -463,7 +455,7 @@ def compute_momentum(
     return momentum
 
 
-# ── Conference strength ──────────────────────────────────────
+# ── Conference strength ───────────────────────────────────────
 
 def compute_conference_strength(
     m_conf: pd.DataFrame,
@@ -494,7 +486,7 @@ def compute_conference_strength(
     return conf_strength
 
 
-# ── Coach tournament experience (men only) ───────────────────
+# ── Coach experience (men only) ────────────────────────────────
 
 def compute_coach_experience(
     coaches_df: pd.DataFrame,
@@ -538,7 +530,7 @@ def compute_coach_experience(
     return coach_exp
 
 
-# ── Matchup features ─────────────────────────────────────────
+# ── Matchup features ──────────────────────────────────────────
 
 _STAT_DIFF_COLS = [
     "OffEff", "DefEff", "Tempo",
@@ -654,7 +646,7 @@ def build_matchup_features(
     return feats
 
 
-# ── Training data builder ─────────────────────────────────────
+# ── Training data ─────────────────────────────────────────────
 
 def build_training_data(
     m_tourney: pd.DataFrame,
@@ -707,7 +699,7 @@ def build_training_data(
     return X, y, seasons
 
 
-# ── Evaluation ────────────────────────────────────────────────
+# ── Evaluation ───────────────────────────────────────────────
 
 def compute_sample_weights(seasons: pd.Series, decay: float = 0.60) -> np.ndarray:
     """
@@ -743,7 +735,6 @@ def leave_one_season_out_cv(
                    Only the training-fold slice is passed to fit().
     return_preds: if True, also return array of OOF predictions aligned to X.
     """
-    import gc
     results = {}
     oof = np.zeros(len(y))
     for season in sorted(seasons.unique()):
@@ -1032,7 +1023,7 @@ def generate_submission(
     return sub
 
 
-# ── Visualization helpers ─────────────────────────────────────
+# ── Visualization ─────────────────────────────────────────────
 
 def plot_brier_by_season(
     cv_results: dict[str, dict[int, float]],
@@ -1104,11 +1095,9 @@ def plot_calibration_curve(
     color: str = "#89b4fa",
     ax: plt.Axes | None = None,
 ) -> plt.Axes:
-    """Calibration plot: predicted vs actual win probability."""
+    """Calibration plot: predicted vs actual win probability per bin."""
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 6))
-
-    from sklearn.calibration import calibration_curve
     frac_pos, mean_pred = calibration_curve(y_true, y_pred, n_bins=n_bins)
 
     ax.plot(mean_pred, frac_pos, "o-", color=color, label="Model")
