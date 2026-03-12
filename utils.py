@@ -1,22 +1,26 @@
+# %% [code]
+# %% [code]
+# %% [code]
+# %% [code]
+# %% [code]
+# %% [code]
+# %% [code] {"jupyter":{"outputs_hidden":false}}
 """
-March Machine Learning Mania 2026: data loading, features, model cache, evaluation, visualization.
-
-One big util file because it's already complicated to use these in Kaggle.
+Utilities for March Machine Learning Mania 2026:
+data loading, feature engineering, model caching, evaluation, and visualization.
 """
 
-import gc
 import json
 import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from scipy.stats import linregress
-from sklearn.calibration import calibration_curve
 from sklearn.model_selection import RandomizedSearchCV
+import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-# ── Hyperparameter & model cache ───────────────────────────────
+# ── Hyperparameter cache ──────────────────────────────────────
 
 _PARAMS_FILE = Path("best_params.json")
 
@@ -34,6 +38,8 @@ def load_params(name: str, path: Path = _PARAMS_FILE) -> dict | None:
         return None
     return json.loads(path.read_text()).get(name)
 
+
+# ── Model cache ───────────────────────────────────────────────
 
 _MODELS_DIR = Path("models")
 
@@ -112,7 +118,7 @@ def train_or_load(name: str, model_factory, X_train, y_train,
     return model
 
 
-# ── Data loading ───────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────
 
 DATA_DIR = Path("data")
 
@@ -148,7 +154,7 @@ def load_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     return data
 
 
-# ── Seeds ──────────────────────────────────────────────────────
+# ── Seed helpers ──────────────────────────────────────────────
 
 def parse_seed(seed_str: str) -> int:
     """Extract numeric seed from strings like 'W01', 'X16a' → 1, 16."""
@@ -164,7 +170,7 @@ def build_seed_map(m_seeds: pd.DataFrame, w_seeds: pd.DataFrame) -> dict[tuple[i
     return seed_map
 
 
-# ── Elo rating ─────────────────────────────────────────────────
+# ── Elo rating system ─────────────────────────────────────────
 
 def compute_elo(
     regular_df: pd.DataFrame,
@@ -245,6 +251,8 @@ def compute_elo_trajectory_stats(
     EloStd   = std dev of within-season Elo (lower = more consistent team).
     If mov=True: scale K by margin of victory (FiveThirtyEight-style).
     """
+    from scipy.stats import linregress as _lr
+
     games = regular_df.sort_values(["Season", "DayNum"])
     elo: dict[int, float] = {}
     trajectory: dict[tuple[int, int], list[float]] = {}
@@ -285,13 +293,13 @@ def compute_elo_trajectory_stats(
         if len(vals) < 3:
             result[(season, tid)] = {"EloTrend": np.nan, "EloStd": np.nan}
         else:
-            slope = float(linregress(range(len(vals)), vals).slope)
+            slope = float(_lr(range(len(vals)), vals).slope)
             result[(season, tid)] = {"EloTrend": slope, "EloStd": float(np.std(vals))}
 
     return result
 
 
-# ── Season stats (Kenpom-style) ────────────────────────────────
+# ── Season statistics ─────────────────────────────────────────
 
 def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -376,7 +384,7 @@ def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
     return stats[keep]
 
 
-# ── Massey ordinals (men only) ──────────────────────────────────
+# ── Massey ordinals ───────────────────────────────────────────
 
 def compute_massey_features(
     massey_df: pd.DataFrame,
@@ -396,7 +404,7 @@ def compute_massey_features(
     return agg
 
 
-# ── Strength of schedule ───────────────────────────────────────
+# ── Strength of schedule ─────────────────────────────────────
 
 def compute_sos(
     m_regular: pd.DataFrame,
@@ -426,7 +434,7 @@ def compute_sos(
     return sos
 
 
-# ── Momentum (last-N games) ────────────────────────────────────
+# ── Momentum (last-N games) ─────────────────────────────────
 
 def compute_momentum(
     m_regular: pd.DataFrame,
@@ -455,7 +463,7 @@ def compute_momentum(
     return momentum
 
 
-# ── Conference strength ───────────────────────────────────────
+# ── Conference strength ──────────────────────────────────────
 
 def compute_conference_strength(
     m_conf: pd.DataFrame,
@@ -486,7 +494,7 @@ def compute_conference_strength(
     return conf_strength
 
 
-# ── Coach experience (men only) ────────────────────────────────
+# ── Coach tournament experience (men only) ───────────────────
 
 def compute_coach_experience(
     coaches_df: pd.DataFrame,
@@ -530,7 +538,7 @@ def compute_coach_experience(
     return coach_exp
 
 
-# ── Matchup features ──────────────────────────────────────────
+# ── Matchup features ─────────────────────────────────────────
 
 _STAT_DIFF_COLS = [
     "OffEff", "DefEff", "Tempo",
@@ -646,7 +654,7 @@ def build_matchup_features(
     return feats
 
 
-# ── Training data ─────────────────────────────────────────────
+# ── Training data builder ─────────────────────────────────────
 
 def build_training_data(
     m_tourney: pd.DataFrame,
@@ -662,20 +670,18 @@ def build_training_data(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
-    Build (X, y, seasons, genders) from historical tournament results.
+    Build (X, y, seasons) from historical tournament results.
 
     For each game: Team1 = lower TeamID, y = 1 if Team1 won.
     Features use previous-season Elo + current-season stats/seeds/Massey.
-    genders: 'M' for men's games, 'W' for women's games.
     """
     records = []
     labels = []
     szns = []
-    genders = []
 
-    for t_df, gender in [(m_tourney, "M"), (w_tourney, "W")]:
+    for t_df in [m_tourney, w_tourney]:
         for _, row in t_df.iterrows():
             season = row["Season"]
             if season < min_season:
@@ -694,16 +700,14 @@ def build_training_data(
             records.append(feats)
             labels.append(1 if w_id == t1 else 0)
             szns.append(season)
-            genders.append(gender)
 
     X = pd.DataFrame(records)
     y = pd.Series(labels, name="y")
     seasons = pd.Series(szns, name="Season")
-    genders = pd.Series(genders, name="Gender")
-    return X, y, seasons, genders
+    return X, y, seasons
 
 
-# ── Evaluation ───────────────────────────────────────────────
+# ── Evaluation ────────────────────────────────────────────────
 
 def compute_sample_weights(seasons: pd.Series, decay: float = 0.60) -> np.ndarray:
     """
@@ -739,6 +743,7 @@ def leave_one_season_out_cv(
                    Only the training-fold slice is passed to fit().
     return_preds: if True, also return array of OOF predictions aligned to X.
     """
+    import gc
     results = {}
     oof = np.zeros(len(y))
     for season in sorted(seasons.unique()):
@@ -767,68 +772,6 @@ def leave_one_season_out_cv(
 
     mean_b = np.mean(list(results.values()))
     print(f"  LOSO mean Brier: {mean_b:.4f}")
-    if return_preds:
-        return results, oof
-    return results
-
-
-def leave_one_season_out_cv_gendered(
-    model_factory_m,
-    model_factory_w,
-    X: pd.DataFrame,
-    y: pd.Series,
-    seasons: pd.Series,
-    genders: pd.Series,
-    feature_cols_m: list[str],
-    feature_cols_w: list[str],
-    impute: bool = False,
-    sample_weight: np.ndarray | None = None,
-    return_preds: bool = False,
-) -> dict[int, float]:
-    """
-    Gender-split LOSO CV: trains separate men's and women's models per fold.
-
-    Returns {season: brier_score} computed over both genders combined.
-    """
-    results = {}
-    oof = np.zeros(len(y))
-    for season in sorted(seasons.unique()):
-        for gender, factory, feat_cols in [("M", model_factory_m, feature_cols_m),
-                                            ("W", model_factory_w, feature_cols_w)]:
-            mask_g = (genders == gender).values
-            train_mask = (seasons != season).values & mask_g
-            test_mask = (seasons == season).values & mask_g
-
-            if test_mask.sum() == 0:
-                continue
-
-            X_train = X.loc[train_mask, feat_cols].copy()
-            X_test = X.loc[test_mask, feat_cols].copy()
-            y_train, y_test = y[train_mask], y[test_mask]
-
-            if impute:
-                medians = X_train.median()
-                X_train = X_train.fillna(medians)
-                X_test = X_test.fillna(medians)
-
-            fit_kwargs = {}
-            if sample_weight is not None:
-                fit_kwargs["sample_weight"] = sample_weight[train_mask]
-
-            model = factory()
-            model.fit(X_train, y_train.values, **fit_kwargs)
-            proba = model.predict_proba(X_test)[:, 1]
-            oof[test_mask] = proba
-            del model, X_train, X_test
-            gc.collect()
-
-        # Combined Brier for this season
-        season_mask = (seasons == season).values
-        if season_mask.sum() > 0:
-            results[season] = brier_score(y[season_mask].values, oof[season_mask])
-
-    mean_b = np.mean(list(results.values()))
-    print(f"  LOSO mean Brier (gendered): {mean_b:.4f}")
     if return_preds:
         return results, oof
     return results
@@ -1089,75 +1032,7 @@ def generate_submission(
     return sub
 
 
-def generate_submission_gendered(
-    sample_sub: pd.DataFrame,
-    models_m: dict[str, object],
-    models_w: dict[str, object],
-    weights_m: dict[str, float],
-    weights_w: dict[str, float],
-    elo_prev: dict,
-    elo_curr: dict,
-    seed_map: dict,
-    stats_df: pd.DataFrame,
-    massey_df: pd.DataFrame | None,
-    feature_cols_m: list[str],
-    feature_cols_w: list[str],
-    impute_medians_m: dict[str, float] | None = None,
-    impute_medians_w: dict[str, float] | None = None,
-    clip_range: tuple[float, float] = (0.01, 0.99),
-    elo_stats: dict | None = None,
-    sos: dict | None = None,
-    momentum: dict | None = None,
-    conf_strength: dict | None = None,
-    coach_exp: dict | None = None,
-) -> pd.DataFrame:
-    """
-    Generate submission using separate men's and women's model ensembles.
-    """
-    print("Building features...")
-    X_all = build_features_vectorized(
-        sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df,
-        elo_stats=elo_stats, sos=sos, momentum=momentum,
-        conf_strength=conf_strength, coach_exp=coach_exp,
-    )
-
-    # Split by gender using team IDs
-    team1 = sample_sub["ID"].str.split("_").str[1].astype(int)
-    is_mens = (team1 < 2000).values
-
-    preds = np.zeros(len(X_all))
-
-    for gender_mask, models, weights, feat_cols, impute_medians, label in [
-        (is_mens, models_m, weights_m, feature_cols_m, impute_medians_m, "Men"),
-        (~is_mens, models_w, weights_w, feature_cols_w, impute_medians_w, "Women"),
-    ]:
-        X_sub = X_all.loc[gender_mask, feat_cols]
-        X_imputed = X_sub.fillna(impute_medians) if impute_medians else None
-        print(f"  {label}: {X_sub.shape[0]:,} rows, {len(feat_cols)} features")
-
-        gender_preds = np.zeros(gender_mask.sum())
-        for name, model in models.items():
-            w = weights[name]
-            if w == 0:
-                continue
-            X_input = X_imputed if X_imputed is not None else X_sub
-            batch_size = 10_000
-            proba = np.empty(len(X_input))
-            for start in range(0, len(X_input), batch_size):
-                end = min(start + batch_size, len(X_input))
-                proba[start:end] = model.predict_proba(X_input.iloc[start:end].values)[:, 1]
-            gender_preds += w * proba
-            print(f"    {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
-
-        preds[gender_mask] = gender_preds
-
-    preds = np.clip(preds, *clip_range)
-    sub = sample_sub[["ID"]].copy()
-    sub["Pred"] = preds
-    return sub
-
-
-# ── Visualization ─────────────────────────────────────────────
+# ── Visualization helpers ─────────────────────────────────────
 
 def plot_brier_by_season(
     cv_results: dict[str, dict[int, float]],
@@ -1229,9 +1104,11 @@ def plot_calibration_curve(
     color: str = "#89b4fa",
     ax: plt.Axes | None = None,
 ) -> plt.Axes:
-    """Calibration plot: predicted vs actual win probability per bin."""
+    """Calibration plot: predicted vs actual win probability."""
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 6))
+
+    from sklearn.calibration import calibration_curve
     frac_pos, mean_pred = calibration_curve(y_true, y_pred, n_bins=n_bins)
 
     ax.plot(mean_pred, frac_pos, "o-", color=color, label="Model")
