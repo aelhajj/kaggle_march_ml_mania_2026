@@ -379,21 +379,43 @@ def compute_season_stats(detail_df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Massey ordinals (men only) ──────────────────────────────────
 
+MASSEY_TOP_SYSTEMS = ["WLK", "POM", "MOR"]
+
 def compute_massey_features(
     massey_df: pd.DataFrame,
     day_threshold: int = 128,
+    top_systems: list[str] | None = None,
 ) -> pd.DataFrame:
     """
     Aggregate Massey ordinal rankings into per-team-per-season features.
 
-    Filters to late-season rankings (DayNum >= day_threshold) then computes
-    mean and median rank across all systems for each (Season, TeamID).
+    Filters to late-season rankings (DayNum >= day_threshold).
+    Returns individual rank columns for top systems (e.g. Massey_WLK, Massey_POM)
+    plus MasseyMean as fallback for seasons where individual systems are missing.
     Men's only — women's teams will get NaN.
     """
+    if top_systems is None:
+        top_systems = MASSEY_TOP_SYSTEMS
     late = massey_df[massey_df["RankingDayNum"] >= day_threshold]
+
+    # Overall mean (fallback)
     agg = late.groupby(["Season", "TeamID"])["OrdinalRank"].agg(
         MasseyMean="mean",
     ).reset_index()
+
+    # Per-system: use last available ranking day per season
+    for sys_name in top_systems:
+        sys_data = late[late["SystemName"] == sys_name]
+        if sys_data.empty:
+            agg[f"Massey_{sys_name}"] = np.nan
+            continue
+        # Take latest ranking day per season per team
+        idx = sys_data.groupby(["Season", "TeamID"])["RankingDayNum"].idxmax()
+        sys_latest = sys_data.loc[idx, ["Season", "TeamID", "OrdinalRank"]].rename(
+            columns={"OrdinalRank": f"Massey_{sys_name}"}
+        )
+        agg = agg.merge(sys_latest, on=["Season", "TeamID"], how="left")
+
     return agg
 
 
@@ -551,14 +573,15 @@ def _get_team_stats(team_id: int, season: int, stats_df: pd.DataFrame) -> dict:
 
 def _get_massey(team_id: int, season: int, massey_df: pd.DataFrame | None) -> dict:
     """Lookup Massey features for a team."""
+    massey_cols = ["MasseyMean"] + [f"Massey_{s}" for s in MASSEY_TOP_SYSTEMS]
     if massey_df is None:
-        return {"MasseyMean": np.nan}
+        return {c: np.nan for c in massey_cols}
     mask = (massey_df["Season"] == season) & (massey_df["TeamID"] == team_id)
     rows = massey_df.loc[mask]
     if rows.empty:
-        return {"MasseyMean": np.nan}
+        return {c: np.nan for c in massey_cols}
     row = rows.iloc[0]
-    return {"MasseyMean": row["MasseyMean"]}
+    return {c: row.get(c, np.nan) for c in massey_cols}
 
 
 def build_matchup_features(
@@ -610,10 +633,13 @@ def build_matchup_features(
         else:
             feats[f"{col}Diff"] = st1[col] - st2[col]
 
-    # Massey diff (men only, NaN for women)
+    # Massey diffs (men only, NaN for women) — lower rank is better
     m1 = _get_massey(t1, season, massey_df)
     m2 = _get_massey(t2, season, massey_df)
-    feats["MasseyMeanDiff"] = m2["MasseyMean"] - m1["MasseyMean"]  # lower rank is better
+    feats["MasseyMeanDiff"] = m2["MasseyMean"] - m1["MasseyMean"]
+    for sys_name in MASSEY_TOP_SYSTEMS:
+        col = f"Massey_{sys_name}"
+        feats[f"{col}Diff"] = m2[col] - m1[col]
 
     # Strength of schedule
     if sos is not None:
@@ -914,15 +940,17 @@ def _join_team_features(
         on=["Season", team_col], how="left",
     )
 
+    massey_cols = ["MasseyMean"] + [f"Massey_{s}" for s in MASSEY_TOP_SYSTEMS]
     if massey_df is not None:
+        rename_map = {"TeamID": team_col}
+        rename_map.update({c: f"{c}_{suffix}" for c in massey_cols if c in massey_df.columns})
         df = df.merge(
-            massey_df.rename(
-                columns={"TeamID": team_col, "MasseyMean": f"MasseyMean_{suffix}"}
-            ),
+            massey_df.rename(columns=rename_map),
             on=["Season", team_col], how="left",
         )
     else:
-        df[f"MasseyMean_{suffix}"] = np.nan
+        for c in massey_cols:
+            df[f"{c}_{suffix}"] = np.nan
 
     for extra_df, col_name in [
         (elo_stats_df, None),  # handled specially below
@@ -1008,6 +1036,10 @@ def build_features_vectorized(
             out[f"{col}Diff"] = df[f"{col}_T1"] - df[f"{col}_T2"]
 
     out["MasseyMeanDiff"] = df["MasseyMean_T2"] - df["MasseyMean_T1"]
+    for sys_name in MASSEY_TOP_SYSTEMS:
+        col = f"Massey_{sys_name}"
+        if f"{col}_T1" in df.columns:
+            out[f"{col}Diff"] = df[f"{col}_T2"] - df[f"{col}_T1"]
 
     if sos is not None:
         out["SOSDiff"] = df["SOS_T1"].fillna(1500) - df["SOS_T2"].fillna(1500)
@@ -1079,7 +1111,7 @@ def generate_submission(
         proba = np.empty(len(X_input))
         for start in range(0, len(X_input), batch_size):
             end = min(start + batch_size, len(X_input))
-            proba[start:end] = model.predict_proba(X_input.iloc[start:end].values)[:, 1]
+            proba[start:end] = model.predict_proba(X_input.iloc[start:end])[:, 1]
         preds += w * proba
         print(f"  {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
 
@@ -1146,7 +1178,7 @@ def generate_submission_gendered(
             proba = np.empty(len(X_input))
             for start in range(0, len(X_input), batch_size):
                 end = min(start + batch_size, len(X_input))
-                proba[start:end] = model.predict_proba(X_input.iloc[start:end].values)[:, 1]
+                proba[start:end] = model.predict_proba(X_input.iloc[start:end])[:, 1]
             gender_preds += w * proba
             print(f"    {name}: mean={proba.mean():.4f}, std={proba.std():.4f}")
 
