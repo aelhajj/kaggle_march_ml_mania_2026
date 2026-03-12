@@ -134,6 +134,8 @@ _CSV_MAP = {
     "m_conferences":    "MTeamConferences.csv",
     "w_conferences":    "WTeamConferences.csv",
     "m_coaches":        "MTeamCoaches.csv",
+    "m_conf_tourney":   "MConferenceTourneyGames.csv",
+    "w_conf_tourney":   "WConferenceTourneyGames.csv",
     "sample_sub":       "SampleSubmissionStage1.csv",
     "sample_sub2":      "SampleSubmissionStage2.csv",
 }
@@ -553,6 +555,148 @@ def compute_coach_experience(
     return coach_exp
 
 
+# ── Seed matchup prior ────────────────────────────────────────
+
+def compute_seed_matchup_prior(
+    m_tourney: pd.DataFrame,
+    w_tourney: pd.DataFrame,
+    m_seeds: pd.DataFrame,
+    w_seeds: pd.DataFrame,
+) -> dict[tuple[int, int], float]:
+    """
+    Historical win probability for the better-seeded team in each seed pairing.
+
+    Returns dict mapping (seed_high, seed_low) → P(better seed wins).
+    Computed from all historical tournament games. For seed pairs with
+    too few games (<3), falls back to a logistic fit on seed diff.
+    """
+    from sklearn.linear_model import LogisticRegression as _LR
+
+    # Parse seed numbers
+    def _parse(seeds_df):
+        s = seeds_df.copy()
+        s["SeedNum"] = s["Seed"].str[1:3].astype(int)
+        return dict(zip(zip(s["Season"], s["TeamID"]), s["SeedNum"]))
+
+    seed_map = {**_parse(m_seeds), **_parse(w_seeds)}
+
+    records = []
+    for t_df in [m_tourney, w_tourney]:
+        for _, row in t_df.iterrows():
+            s_w = seed_map.get((row["Season"], row["WTeamID"]))
+            s_l = seed_map.get((row["Season"], row["LTeamID"]))
+            if s_w is not None and s_l is not None:
+                high = min(s_w, s_l)
+                low = max(s_w, s_l)
+                fav_won = 1 if s_w <= s_l else 0  # equal seeds: either is "fav"
+                records.append((high, low, fav_won))
+
+    # Count win rates per seed pairing
+    from collections import Counter
+    wins = Counter()
+    total = Counter()
+    for high, low, fav_won in records:
+        wins[(high, low)] += fav_won
+        total[(high, low)] += 1
+
+    # Logistic fallback for rare matchups
+    X_lr = np.array([[low - high] for high, low, _ in records])
+    y_lr = np.array([fav_won for _, _, fav_won in records])
+    lr = _LR(max_iter=1000)
+    lr.fit(X_lr, y_lr)
+
+    prior = {}
+    for (high, low), n in total.items():
+        if n >= 3:
+            prior[(high, low)] = wins[(high, low)] / n
+        else:
+            prior[(high, low)] = float(lr.predict_proba([[low - high]])[0, 1])
+
+    return prior
+
+
+# ── Conference tourney champion ───────────────────────────────
+
+def compute_conf_tourney_champion(
+    m_conf_tourney: pd.DataFrame,
+    w_conf_tourney: pd.DataFrame,
+) -> dict[tuple[int, int], int]:
+    """
+    Flag teams that won their conference tournament (= auto-bid teams).
+
+    Returns dict mapping (season, team_id) → 1 if conf tourney champ, else 0.
+    Also includes conf tourney wins count as a secondary signal.
+    """
+    result = {}
+    for ct_df in [m_conf_tourney, w_conf_tourney]:
+        for (season, conf), grp in ct_df.groupby(["Season", "ConfAbbrev"]):
+            # The winner of the last game in each conference tourney is the champion
+            last_game = grp.loc[grp["DayNum"].idxmax()]
+            champ_id = last_game["WTeamID"]
+            result[(season, champ_id)] = 1
+
+            # Count conf tourney wins for all teams
+            for tid in set(grp["WTeamID"]).union(set(grp["LTeamID"])):
+                if (season, tid) not in result:
+                    result[(season, tid)] = 0
+
+    return result
+
+
+def compute_conf_tourney_wins(
+    m_conf_tourney: pd.DataFrame,
+    w_conf_tourney: pd.DataFrame,
+) -> dict[tuple[int, int], int]:
+    """Number of conference tournament wins per team per season."""
+    result = {}
+    for ct_df in [m_conf_tourney, w_conf_tourney]:
+        for _, row in ct_df.iterrows():
+            key = (row["Season"], row["WTeamID"])
+            result[key] = result.get(key, 0) + 1
+            # Losers get 0 if not already set
+            lkey = (row["Season"], row["LTeamID"])
+            if lkey not in result:
+                result[lkey] = 0
+    return result
+
+
+# ── Close-game win rate ───────────────────────────────────────
+
+def compute_close_game_win_rate(
+    m_regular: pd.DataFrame,
+    w_regular: pd.DataFrame,
+    margin_threshold: int = 5,
+) -> dict[tuple[int, int], float]:
+    """
+    Win rate in close games (decided by <= margin_threshold points).
+
+    Captures "clutch" ability — teams that consistently win tight games
+    tend to perform well in tournament pressure situations.
+    Returns 0.5 for teams with no close games.
+    """
+    result = {}
+    for df in [m_regular, w_regular]:
+        df = df.copy()
+        df["Margin"] = df["WScore"] - df["LScore"]
+        close = df[df["Margin"] <= margin_threshold]
+
+        for season in close["Season"].unique():
+            sdf = close[close["Season"] == season]
+            wins: dict[int, int] = {}
+            losses: dict[int, int] = {}
+            for _, row in sdf.iterrows():
+                wins[row["WTeamID"]] = wins.get(row["WTeamID"], 0) + 1
+                losses[row["LTeamID"]] = losses.get(row["LTeamID"], 0) + 1
+
+            all_teams = set(wins.keys()) | set(losses.keys())
+            for tid in all_teams:
+                w = wins.get(tid, 0)
+                l = losses.get(tid, 0)
+                result[(season, tid)] = w / (w + l) if (w + l) > 0 else 0.5
+
+    return result
+
+
 # ── Matchup features ──────────────────────────────────────────
 
 _STAT_DIFF_COLS = [
@@ -594,6 +738,10 @@ def build_matchup_features(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
+    seed_prior: dict | None = None,
+    conf_champ: dict | None = None,
+    conf_tourney_wins: dict | None = None,
+    close_game_wr: dict | None = None,
 ) -> dict:
     """
     Build feature dict for a Team1-vs-Team2 matchup.
@@ -670,6 +818,25 @@ def build_matchup_features(
         feats["EloTrendDiff"] = e1s["EloTrend"] - e2s["EloTrend"]
         feats["EloStdDiff"] = e1s["EloStd"] - e2s["EloStd"]
 
+    # Seed matchup prior: historical P(better seed wins) for this seed pairing
+    if seed_prior is not None and not (np.isnan(s1) or np.isnan(s2)):
+        high, low = int(min(s1, s2)), int(max(s1, s2))
+        prior_p = seed_prior.get((high, low), 0.5)
+        # Convert to T1 perspective: if T1 is the better seed, prior favors T1
+        feats["SeedMatchupPrior"] = prior_p if s1 <= s2 else (1.0 - prior_p)
+    elif seed_prior is not None:
+        feats["SeedMatchupPrior"] = np.nan
+
+    # Conference tourney champion flag + wins
+    if conf_champ is not None:
+        feats["ConfChampDiff"] = conf_champ.get((season, t1), 0) - conf_champ.get((season, t2), 0)
+    if conf_tourney_wins is not None:
+        feats["ConfTourneyWinsDiff"] = conf_tourney_wins.get((season, t1), 0) - conf_tourney_wins.get((season, t2), 0)
+
+    # Close-game win rate
+    if close_game_wr is not None:
+        feats["CloseWinRateDiff"] = close_game_wr.get((season, t1), 0.5) - close_game_wr.get((season, t2), 0.5)
+
     return feats
 
 
@@ -689,6 +856,10 @@ def build_training_data(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
+    seed_prior: dict | None = None,
+    conf_champ: dict | None = None,
+    conf_tourney_wins: dict | None = None,
+    close_game_wr: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Build (X, y, seasons, genders) from historical tournament results.
@@ -717,6 +888,8 @@ def build_training_data(
                 elo_stats=elo_stats,
                 sos=sos, momentum=momentum,
                 conf_strength=conf_strength, coach_exp=coach_exp,
+                seed_prior=seed_prior, conf_champ=conf_champ,
+                conf_tourney_wins=conf_tourney_wins, close_game_wr=close_game_wr,
             )
             records.append(feats)
             labels.append(1 if w_id == t1 else 0)
@@ -912,6 +1085,9 @@ def _join_team_features(
     momentum_df: pd.DataFrame | None = None,
     conf_df: pd.DataFrame | None = None,
     coach_df: pd.DataFrame | None = None,
+    conf_champ_df: pd.DataFrame | None = None,
+    conf_tw_df: pd.DataFrame | None = None,
+    close_wr_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Join all per-team features onto `base` for a given team column.
@@ -958,6 +1134,9 @@ def _join_team_features(
         (momentum_df, "Momentum"),
         (conf_df, "ConfStrength"),
         (coach_df, "CoachExp"),
+        (conf_champ_df, "ConfChamp"),
+        (conf_tw_df, "ConfTourneyWins"),
+        (close_wr_df, "CloseWinRate"),
     ]:
         if col_name is None:
             # Elo stats has two columns
@@ -998,6 +1177,10 @@ def build_features_vectorized(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
+    seed_prior: dict | None = None,
+    conf_champ: dict | None = None,
+    conf_tourney_wins: dict | None = None,
+    close_game_wr: dict | None = None,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for a submission file vectorized via joins.
@@ -1013,10 +1196,15 @@ def build_features_vectorized(
     momentum_df = _dict_to_df(momentum, "Momentum") if momentum else None
     conf_df = _dict_to_df(conf_strength, "ConfStrength") if conf_strength else None
     coach_df = _dict_to_df(coach_exp, "CoachExp") if coach_exp else None
+    conf_champ_df = _dict_to_df(conf_champ, "ConfChamp") if conf_champ else None
+    conf_tw_df = _dict_to_df(conf_tourney_wins, "ConfTourneyWins") if conf_tourney_wins else None
+    close_wr_df = _dict_to_df(close_game_wr, "CloseWinRate") if close_game_wr else None
 
     df = ids.copy()
     join_args = dict(elo_stats_df=elo_stats_df, sos_df=sos_df, momentum_df=momentum_df,
-                     conf_df=conf_df, coach_df=coach_df)
+                     conf_df=conf_df, coach_df=coach_df,
+                     conf_champ_df=conf_champ_df, conf_tw_df=conf_tw_df,
+                     close_wr_df=close_wr_df)
     df = _join_team_features(df, "T1", "T1", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, **join_args)
     df = _join_team_features(df, "T2", "T2", elo_prev_df, elo_curr_df, seed_df, stats_df, massey_df, **join_args)
 
@@ -1054,6 +1242,34 @@ def build_features_vectorized(
         out["EloTrendDiff"] = df["EloTrend_T1"] - df["EloTrend_T2"]
         out["EloStdDiff"] = df["EloStd_T1"] - df["EloStd_T2"]
 
+    # Seed matchup prior (vectorized)
+    if seed_prior is not None:
+        s1 = df["Seed_T1"]
+        s2 = df["Seed_T2"]
+        has_seeds = s1.notna() & s2.notna()
+        high = np.minimum(s1, s2).astype("Int64")
+        low = np.maximum(s1, s2).astype("Int64")
+        # Build lookup: map each (high, low) pair to prior probability
+        prior_series = pd.Series(
+            [seed_prior.get((h, l), 0.5) if notna else np.nan
+             for h, l, notna in zip(high, low, has_seeds)],
+            index=df.index,
+        )
+        # Flip to T1 perspective: if T1 is the worse seed, use 1 - prior
+        t1_is_fav = s1 <= s2
+        prior_col = np.where(has_seeds, np.where(t1_is_fav, prior_series, 1.0 - prior_series), np.nan)
+        out["SeedMatchupPrior"] = prior_col
+
+    # Conference tourney features
+    if conf_champ is not None:
+        out["ConfChampDiff"] = df["ConfChamp_T1"].fillna(0) - df["ConfChamp_T2"].fillna(0)
+    if conf_tourney_wins is not None:
+        out["ConfTourneyWinsDiff"] = df["ConfTourneyWins_T1"].fillna(0) - df["ConfTourneyWins_T2"].fillna(0)
+
+    # Close-game win rate
+    if close_game_wr is not None:
+        out["CloseWinRateDiff"] = df["CloseWinRate_T1"].fillna(0.5) - df["CloseWinRate_T2"].fillna(0.5)
+
     return out
 
 
@@ -1082,6 +1298,7 @@ def generate_submission(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
+    **extra_features,
 ) -> pd.DataFrame:
     """
     Generate submission by ensembling multiple models (vectorized).
@@ -1094,6 +1311,7 @@ def generate_submission(
         sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df,
         elo_stats=elo_stats, sos=sos, momentum=momentum,
         conf_strength=conf_strength, coach_exp=coach_exp,
+        **extra_features,
     )
     X_sub = X_sub[feature_cols]
     print(f"  Feature matrix: {X_sub.shape}")
@@ -1143,6 +1361,7 @@ def generate_submission_gendered(
     momentum: dict | None = None,
     conf_strength: dict | None = None,
     coach_exp: dict | None = None,
+    **extra_features,
 ) -> pd.DataFrame:
     """
     Generate submission using separate men's and women's model ensembles.
@@ -1152,6 +1371,7 @@ def generate_submission_gendered(
         sample_sub, elo_prev, elo_curr, seed_map, stats_df, massey_df,
         elo_stats=elo_stats, sos=sos, momentum=momentum,
         conf_strength=conf_strength, coach_exp=coach_exp,
+        **extra_features,
     )
 
     # Split by gender using team IDs
