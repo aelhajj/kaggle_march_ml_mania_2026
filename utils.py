@@ -837,6 +837,10 @@ def build_matchup_features(
     if close_game_wr is not None:
         feats["CloseWinRateDiff"] = close_game_wr.get((season, t1), 0.5) - close_game_wr.get((season, t2), 0.5)
 
+    # Interaction features (help LR capture nonlinear effects)
+    feats["SeedDiffSq"] = feats["SeedDiff"] ** 2
+    feats["SeedEloDiff"] = feats["SeedDiff"] * feats["EloMOVDiff"]
+
     return feats
 
 
@@ -1269,6 +1273,10 @@ def build_features_vectorized(
     # Close-game win rate
     if close_game_wr is not None:
         out["CloseWinRateDiff"] = df["CloseWinRate_T1"].fillna(0.5) - df["CloseWinRate_T2"].fillna(0.5)
+
+    # Interaction features (help LR capture nonlinear effects)
+    out["SeedDiffSq"] = out["SeedDiff"] ** 2
+    out["SeedEloDiff"] = out["SeedDiff"] * out["EloMOVDiff"]
 
     return out
 
