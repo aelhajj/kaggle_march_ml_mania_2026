@@ -1,4 +1,5 @@
 # %% [code]
+# %% [code]
 """
 March Machine Learning Mania 2026: data loading, features, model cache, evaluation, visualization.
 
